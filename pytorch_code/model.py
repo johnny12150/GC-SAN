@@ -95,6 +95,7 @@ class SessionGraph(Module):
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
         self.reset_parameters()
         self.rn = Residual()
+        self.multihead_attn = nn.MultiheadAttention(self.hidden_size, 1).cuda()
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
@@ -103,20 +104,20 @@ class SessionGraph(Module):
 
     def compute_scores(self, hidden, mask, self_att=1, residual=1, k_blocks=2):
         ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
-
         if self_att:
             # 加上 self attention
-            multihead_attn = nn.MultiheadAttention(hidden.shape[2], 1).cuda()
             attn_output = hidden
             for k in range(k_blocks):
-                attn_output, attn_output_weights = multihead_attn(attn_output, attn_output, attn_output)
+                attn_output, attn_output_weights = self.multihead_attn(attn_output, attn_output, attn_output)
                 # 加上 residual network
                 if residual:
                     attn_output = self.rn(attn_output)
 
             # get context vector
-            a = torch.sum(attn_output, 1)
-            a += ht
+            # a = torch.sum(attn_output, 1)
+            hn = attn_output[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]
+            hn += ht  # consider current interest
+            a = hn
 
         else:
             # attention with ht as query
