@@ -17,6 +17,13 @@ from torch.nn import MultiheadAttention
 from torchsummary import summary
 
 
+class Blocks(Module):
+    def __init__(self):
+        super().__init__()
+        self.rn = Residual()
+        self.self_att = nn.MultiheadAttention(100, 1).cuda()
+
+
 class Residual(Module):
     def __init__(self):
         super().__init__()
@@ -94,17 +101,22 @@ class SessionGraph(Module):
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def compute_scores(self, hidden, mask, self_att=1, residual=1):
+    def compute_scores(self, hidden, mask, self_att=1, residual=1, k_blocks=2):
         ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
+
         if self_att:
             # 加上 self attention
             multihead_attn = nn.MultiheadAttention(hidden.shape[2], 1).cuda()
-            attn_output, attn_output_weights = multihead_attn(hidden, hidden, hidden)
-            # 加上 residual network, 反而降低了MRR
-            if residual:
-                attn_output = self.rn(attn_output)
+            attn_output = hidden
+            for k in range(k_blocks):
+                attn_output, attn_output_weights = multihead_attn(attn_output, attn_output, attn_output)
+                # 加上 residual network
+                if residual:
+                    attn_output = self.rn(attn_output)
+
             # get context vector
             a = torch.sum(attn_output, 1)
+            a += ht
 
         else:
             # attention with ht as query
