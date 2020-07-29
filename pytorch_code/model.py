@@ -14,6 +14,22 @@ from torch import nn
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 from torch.nn import MultiheadAttention
+from torchsummary import summary
+
+
+class Residual(Module):
+    def __init__(self):
+        super().__init__()
+        self.hidden_size = 100
+        self.d1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.d2 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+
+    def forward(self, x):
+        residual = x  # keep original input
+        x = F.relu(self.d1(x))
+        x = self.d2(x)
+        out = residual + x
+        return out
 
 
 class GNN(Module):
@@ -71,22 +87,27 @@ class SessionGraph(Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
         self.reset_parameters()
+        self.rn = Residual()
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def compute_scores(self, hidden, mask, self_att=1):
+    def compute_scores(self, hidden, mask, self_att=1, residual=1):
         ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
         if self_att:
             # 加上 self attention
             multihead_attn = nn.MultiheadAttention(hidden.shape[2], 1).cuda()
             attn_output, attn_output_weights = multihead_attn(hidden, hidden, hidden)
+            # 加上 residual network, 反而降低了MRR
+            if residual:
+                attn_output = self.rn(attn_output)
+            # get context vector
             a = torch.sum(attn_output, 1)
-            # todo 加上 residual network
 
         else:
+            # attention with ht as query
             q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
             q2 = self.linear_two(hidden)  # batch_size x seq_length x latent_size
             alpha = self.linear_three(torch.sigmoid(q1 + q2))
@@ -124,6 +145,8 @@ def forward(model, i, data):
     items = trans_to_cuda(torch.Tensor(items).long())
     A = trans_to_cuda(torch.Tensor(A).float())
     mask = trans_to_cuda(torch.Tensor(mask).long())
+    # summary has an embedding bug - https://github.com/jiangxiluning/pytorch-summary
+    # summary(model, [(items.cpu().numpy().shape), (A.cpu().numpy().shape)])  # print model summary
     hidden = model(items, A)
     get = lambda i: hidden[i][alias_inputs[i]]
     seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
