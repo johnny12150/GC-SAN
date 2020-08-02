@@ -15,15 +15,29 @@ import datetime
 import os
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', default='sample', help='dataset name: diginetica/yoochoose/sample')
+parser.add_argument('--dataset', default='diginetica', help='dataset name: diginetica/yoochoose/sample')
+parser.add_argument('--dir', default='')
 opt = parser.parse_args()
 print(opt)
 
+dir = opt.dir
 dataset = 'sample_train-item-views.csv'
 if opt.dataset == 'diginetica':
+    if not dir:
+        dir = 'F:/data/dataset-train-diginetica/'
     dataset = 'train-item-views.csv'
 elif opt.dataset =='yoochoose':
+    if not dir:
+        dir = 'F:/data/yoochoose-data/'
     dataset = 'yoochoose-clicks.dat'
+    if not os.path.exists(dir + 'yoochoose-clicks-withHeader.dat'):
+        # add a header for yoochoose dataset
+        with open(dir + 'yoochoose-clicks.dat', 'r') as f, open(dir + 'yoochoose-clicks-withHeader.dat', 'w') as fn:
+            fn.write('sessionId,timestamp,itemId,category' + '\n')
+            for line in f:
+                fn.write(line)
+
+dataset = dir + dataset
 
 print("-- Starting @ %ss" % datetime.datetime.now())
 with open(dataset, "r") as f:
@@ -31,12 +45,17 @@ with open(dataset, "r") as f:
         reader = csv.DictReader(f, delimiter=',')
     else:
         reader = csv.DictReader(f, delimiter=';')
+
     sess_clicks = {}
     sess_date = {}
     ctr = 0
     curid = -1
     curdate = None
     for data in reader:
+        if opt.dataset == 'diginetica':
+            data['session_id'] = data.pop('sessionId')
+            data['item_id'] = data.pop('itemId')
+
         sessid = data['session_id']
         if curdate and not curid == sessid:
             date = ''
