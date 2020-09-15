@@ -13,30 +13,123 @@ import torch
 from torch import nn
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
-from torch.nn import MultiheadAttention
 from torchsummary import summary
 
 
-class Blocks(Module):
-    def __init__(self):
-        super().__init__()
-        self.rn = Residual()
-        self.self_att = nn.MultiheadAttention(100, 1).cuda()
+class PositionEmbedding(nn.Module):
+
+    MODE_EXPAND = 'MODE_EXPAND'
+    MODE_ADD = 'MODE_ADD'
+    MODE_CONCAT = 'MODE_CONCAT'
+
+    def __init__(self,
+                 num_embeddings,
+                 embedding_dim,
+                 mode=MODE_ADD):
+        super(PositionEmbedding, self).__init__()
+        self.num_embeddings = num_embeddings  # 每一row資料有多長
+        self.embedding_dim = embedding_dim
+        self.mode = mode
+        if self.mode == self.MODE_EXPAND:
+            self.weight = nn.Parameter(torch.Tensor(num_embeddings * 2 + 1, embedding_dim))
+        else:
+            self.weight = nn.Parameter(torch.Tensor(num_embeddings, embedding_dim))
+        # self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_normal_(self.weight)
+
+    def forward(self, x):
+        if self.mode == self.MODE_EXPAND:
+            indices = torch.clamp(x, -self.num_embeddings, self.num_embeddings) + self.num_embeddings
+            return F.embedding(indices.type(torch.LongTensor), self.weight)
+        batch_size, seq_len = x.size()[:2]
+        embeddings = self.weight[:seq_len, :].view(1, seq_len, self.embedding_dim)
+        if self.mode == self.MODE_ADD:
+            return x + embeddings
+        if self.mode == self.MODE_CONCAT:
+            return torch.cat((x, embeddings.repeat(batch_size, 1, 1)), dim=-1)
+        raise NotImplementedError('Unknown mode: %s' % self.mode)
+
+    def extra_repr(self):
+        return 'num_embeddings={}, embedding_dim={}, mode={}'.format(
+            self.num_embeddings, self.embedding_dim, self.mode,
+        )
 
 
 class Residual(Module):
     def __init__(self):
         super().__init__()
-        self.hidden_size = 100
+        self.hidden_size = 120
         self.d1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.d2 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
+        self.dp = nn.Dropout(p=0.2)
+        self.drop = True
 
     def forward(self, x):
         residual = x  # keep original input
         x = F.relu(self.d1(x))
-        x = self.d2(x)
+        if self.drop:
+            x = self.d2(self.dp(x))
+        else:
+            x = self.d2(x)
         out = residual + x
         return out
+
+
+class MultiHeadedAttention(nn.Module):
+    """Multi-Head Attention layer
+
+    :param int n_head: the number of head s
+    :param int n_feat: the number of features
+    :param float dropout_rate: dropout rate
+    """
+
+    def __init__(self, n_head, n_feat, dropout_rate):
+        super(MultiHeadedAttention, self).__init__()
+        assert n_feat % n_head == 0
+        # We assume d_v always equals d_k
+        self.d_k = n_feat // n_head
+        self.h = n_head
+        self.linear_q = nn.Linear(n_feat, n_feat)
+        self.linear_k = nn.Linear(n_feat, n_feat)
+        self.linear_v = nn.Linear(n_feat, n_feat)
+        self.linear_out = nn.Linear(n_feat, n_feat)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout_rate)
+
+    def forward(self, query, key, value, mask):
+        """Compute 'Scaled Dot Product Attention'
+
+        :param torch.Tensor query: (batch, time1, size)
+        :param torch.Tensor key: (batch, time2, size)
+        :param torch.Tensor value: (batch, time2, size)
+        :param torch.Tensor mask: (batch, time1, time2)
+        :param torch.nn.Dropout dropout:
+        :return torch.Tensor: attentined and transformed `value` (batch, time1, d_model)
+             weighted by the query dot key attention (batch, head, time1, time2)
+        """
+        n_batch = query.size(0)
+        q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
+        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
+        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
+        q = q.transpose(1, 2)  # (batch, head, time1, d_k)
+        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
+        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # (batch, head, time1, time2)
+        if mask is not None:
+            mask = mask.unsqueeze(1).eq(0)  # (batch, 1, time1, time2)
+            min_value = float(np.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min)
+            # scores = scores.masked_fill(mask, min_value)
+            self.attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)  # (batch, head, time1, time2)
+        else:
+            self.attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
+
+        p_attn = self.dropout(self.attn)
+        x = torch.matmul(p_attn, v)  # (batch, head, time1, d_k)
+        x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
+        return self.linear_out(x)  # (batch, time1, d_model)
 
 
 class GNN(Module):
@@ -68,7 +161,8 @@ class GNN(Module):
         resetgate = torch.sigmoid(i_r + h_r)
         inputgate = torch.sigmoid(i_i + h_i)
         newgate = torch.tanh(i_n + resetgate * h_n)
-        hy = newgate + inputgate * (hidden - newgate)
+        # hy = newgate + inputgate * (hidden - newgate)
+        hy = hidden - inputgate * (hidden - newgate)
         return hy
 
     def forward(self, A, hidden):
@@ -78,9 +172,10 @@ class GNN(Module):
 
 
 class SessionGraph(Module):
-    def __init__(self, opt, n_node):
+    def __init__(self, opt, n_node, len_max):
         super(SessionGraph, self).__init__()
         self.hidden_size = opt.hiddenSize
+        self.len_max = len_max
         self.n_node = n_node
         self.batch_size = opt.batchSize
         self.nonhybrid = opt.nonhybrid
@@ -90,35 +185,37 @@ class SessionGraph(Module):
         self.linear_two = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_three = nn.Linear(self.hidden_size, 1, bias=False)
         self.linear_transform = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=True)
+        self.rn = Residual()
+        self.multihead_attn = nn.MultiheadAttention(self.hidden_size, 1).cuda()
+        # self.multihead_attn = MultiHeadedAttention(4, self.hidden_size, 0.2).cuda()
+        self.pe = PositionEmbedding(len_max, self.hidden_size)
         self.loss_function = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
         self.reset_parameters()
-        self.rn = Residual()
-        self.multihead_attn = nn.MultiheadAttention(self.hidden_size, 1).cuda()
+
 
     def reset_parameters(self):
         stdv = 1.0 / math.sqrt(self.hidden_size)
         for weight in self.parameters():
             weight.data.uniform_(-stdv, stdv)
 
-    def compute_scores(self, hidden, mask, self_att=1, residual=1, k_blocks=2):
+    def compute_scores(self, hidden, mask, self_att=True, residual=True, k_blocks=4):
         ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # batch_size x latent_size
+        mask_self = mask.repeat(1, mask.shape[1]).view(-1, mask.shape[1], mask.shape[1])
         if self_att:
             # 加上 self attention
             attn_output = hidden
             for k in range(k_blocks):
                 attn_output, attn_output_weights = self.multihead_attn(attn_output, attn_output, attn_output)
+                # fixme 加上 mask會train壞掉
+                # attn_output = self.multihead_attn(attn_output, attn_output, attn_output, mask_self)  # 加上mask
                 # 加上 residual network
                 if residual:
                     attn_output = self.rn(attn_output)
-
-            # get context vector
-            # a = torch.sum(attn_output, 1)
-            hn = attn_output[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]
-            hn += ht  # consider current interest
-            a = hn
-
+            hn = attn_output[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # use last one as global interest
+            # a = hn + ht  # consider current interest
+            a = 0.52*hn + (1-0.52)*ht  # hyper-parameter w
         else:
             # attention with ht as query
             q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # batch_size x 1 x latent_size
@@ -163,6 +260,8 @@ def forward(model, i, data):
     hidden = model(items, A)
     get = lambda i: hidden[i][alias_inputs[i]]
     seq_hidden = torch.stack([get(i) for i in torch.arange(len(alias_inputs)).long()])
+    # 加上 position encoding
+    # seq_hidden = model.pe(seq_hidden)
     return targets, model.compute_scores(seq_hidden, mask)
 
 

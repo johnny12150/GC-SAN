@@ -52,13 +52,15 @@ def split_validation(train_set, valid_portion):
 
 
 class Data():
-    def __init__(self, data, shuffle=False, graph=None):
+    def __init__(self, data, shuffle=False, graph=None, opt=None):
         inputs = data[0]
         inputs, mask, len_max = data_masks(inputs, [0])
         self.inputs = np.asarray(inputs)
         self.mask = np.asarray(mask)
         self.len_max = len_max
         self.targets = np.asarray(data[1])
+        if opt.dynamic:
+            self.targets = np.asarray(data[2])
         self.length = len(inputs)
         self.shuffle = shuffle
         self.graph = graph
