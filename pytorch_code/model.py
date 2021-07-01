@@ -207,9 +207,11 @@ class SessionGraph(Module):
             # 加上 self attention
             attn_output = hidden
             for k in range(k_blocks):
+                attn_output = attn_output.transpose(0,1)
                 attn_output, attn_output_weights = self.multihead_attn(attn_output, attn_output, attn_output)
                 # fixme 加上 mask會train壞掉
                 # attn_output = self.multihead_attn(attn_output, attn_output, attn_output, mask_self)  # 加上mask
+                attn_output = attn_output.transpose(0,1)
                 # 加上 residual network
                 if residual:
                     attn_output = self.rn(attn_output)
